@@ -1,0 +1,14 @@
+# 运行时数据（技能 data 目录内的运行时文件由 data/.gitignore 覆盖）
+data/listen.jsonl
+data/reply_rules.json
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 依赖
+node_modules/
+
+# 运行时日志（wxauto4 调试日志）
+wxauto_logs/
+*.log

@@ -1,0 +1,33 @@
+# @dsh-user/dsh-wxauto bundle patch
+#
+# 挂载微信自动化插件：
+#   - 注册 `dsh-wxauto` 技能到 ctx.skills（agent 可通过技能目录调用发送/监听/桥命令）
+#   - 注册 `wxauto` 设置命名空间（installSettingsSection，配置落在 settings.yaml 的 wxauto: 段）
+#   - 提供 `wxauto` 服务（开关/桥状态/配置；双向桥开关 bridgeEnabled 实时起停）
+#   - 浏览器半边（./client）在设置页注册「微信自动化」卡片
+#
+# 在 dsh-base 之后、用户 cordis.patch.yml 之前应用；需要 skills 与 settings 服务。
+
+- insert:
+    - id: wxauto
+      name: '@dsh-user/dsh-wxauto'
+      inject:
+        - skills
+        - settings
+      config:
+        # 默认配置 = 组合层（settings.yaml 的 wxauto: 用户层可覆盖；cwd 缺省用用户主目录）
+        dshBase: http://127.0.0.1:3080
+        targetChats:
+          - 文件传输助手
+        listenChats:
+          - 文件传输助手
+        bridgeChats: []
+        listenInterval: 3
+        taskTimeout: 900
+        autoReport: true
+        reportPrefix: '[DSH]'
+        reportTail: ''
+        # 双向桥开关：开启=拉起 wx_bridge.py（占用微信窗口），关闭=停止
+        bridgeEnabled: false
+        # 监听开关：关闭时 wx-listen 拒绝启动
+        listenEnabled: false

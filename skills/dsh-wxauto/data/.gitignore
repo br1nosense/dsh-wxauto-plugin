@@ -1,0 +1,15 @@
+# 运行时数据目录：监听日志、回复规则、桥状态/日志、设置镜像、截图、临时报告、锁、待推送
+listen.jsonl
+bridge.jsonl
+bridge_state.json
+bridge.log
+dsh_settings.json
+reply_rules.json
+shots/
+*.tmp
+
+# 运行时状态（含个人聊天数据，勿提交）
+bridge_seen.json
+bridge_pending.json
+wx_daemon.lock
+wx_ui.lock

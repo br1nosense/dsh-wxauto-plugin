@@ -1,0 +1,20 @@
+{
+  "python": "py -3",
+  "target_chats": ["文件传输助手"],
+  "listen_chats": ["文件传输助手"],
+  "listen_interval": 3,
+  "listen_log": "data/listen.jsonl",
+  "reply_rules_file": "data/reply_rules.json",
+  "auto_report": true,
+  "report_prefix": "[DSH]",
+  "report_tail": "\n—— DSH 自动汇报",
+
+  "dsh_base": "http://127.0.0.1:3080",
+  "dsh_cwd": "",
+  "bridge_chats": ["文件传输助手"],
+  "bridge_poll_interval": 3,
+  "bridge_state": "data/bridge_state.json",
+  "bridge_log": "data/bridge.jsonl",
+  "bridge_task_timeout": 900,
+  "shots_dir": "data/shots"
+}
