@@ -93,11 +93,51 @@ class DshClient:
     def rename(self, session_id, title):
         return self.rpc("session.rename", {"sessionId": session_id, "title": title})
 
+    # ---- 回答/取消 pending 提问（ask_user_question）----
+    def respond(self, rpc_id, session_id, ok, value=None, error=None):
+        """向挂起的提问/审批提交响应（client-response 信封，走 /api/respond）。
+
+        ok=True 时 value 传给 ask_user_question 工具结果；
+        ok=False 时以 error（code=cancelled 等）把工具调用置为取消。
+        返回服务端回执 {accepted: bool, reason?}。
+        """
+        result = {"ok": ok}
+        if ok:
+            result["value"] = value if value is not None else {"sessionId": session_id}
+        else:
+            result["error"] = error or {
+                "code": "cancelled", "message": "cancelled by bridge", "details": {}}
+        body = json.dumps({
+            "type": "client-response",
+            "rpcId": rpc_id,
+            "result": result,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            f"{self.base}/api/respond", data=body,
+            headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.URLError as e:
+            raise DshError(f"提交提问响应失败：{e}") from e
+
+    def answer_question(self, rpc_id, session_id, answers):
+        """提交提问答案。answers 形如 {"answers": [{"id","selected":[...],"custom"?}]}。"""
+        return self.respond(rpc_id, session_id, True,
+                            value={"sessionId": session_id, "answer": answers})
+
+    def cancel_question(self, rpc_id, session_id):
+        """把提问置为取消（agent 会收到取消结果继续执行）。"""
+        return self.respond(rpc_id, session_id, False,
+                            error={"code": "cancelled",
+                                   "message": "问题被取消（未收到回答）",
+                                   "details": {}})
+
     def is_running(self, session_id):
         s = self.get_session(session_id)
         return bool(s and s.get("running"))
 
-    def wait_turn_end(self, session_id, timeout=600, poll=3, from_seq=None):
+    def wait_turn_end(self, session_id, timeout=600, poll=3, from_seq=None, keep_waiting=None):
         """等待『from_seq 之后新开始的回合』真正结束，返回 (end_seq, reason)。
 
         修复要点（勿回退）：
@@ -108,6 +148,11 @@ class DshClient:
              DSH 的 running 标志在 agent 各步骤/模型调用间隙可能瞬时为空，
              需连续多轮都未运行才认为回合确实在轮询间隙结束。
           3) 兜底返回的 reason 为 None，由调用方如实上报，绝不假装成功。
+
+        keep_waiting：可调用对象（返回 bool）。当它为真（例如正在等用户回答
+        ask_user_question 提问）时，顺延超时截止时间，且不因『会话短暂未运行』
+        误判结束——即等用户答完问题、回合真正结束后才返回。
+
         正确逻辑：
           1) 等到 from_seq 之后出现 turn/start（我们的回合开始）；
           2) 再等到该回合的 turn/end（携带 reason）；
@@ -117,7 +162,13 @@ class DshClient:
         last = from_seq or 0
         saw_start = False
         idle_ticks = 0
-        while time.time() < deadline:
+        while True:
+            if keep_waiting and keep_waiting():
+                # 正在等用户回答问题：顺延截止时间，重置空闲计数（避免误判回合结束）
+                idle_ticks = 0
+                deadline = max(deadline, time.time() + 60)
+            elif time.time() >= deadline:
+                raise DshError("等待回合结束超时")
             try:
                 h = self.history(session_id, max_messages=400)
             except DshError:
@@ -143,10 +194,13 @@ class DshClient:
                 return ended
             last = max_seen
             if not self.is_running(session_id) and (saw_start or has_new_asst):
-                idle_ticks += 1
-                # 连续 2 轮（约 2×poll 秒）都未运行，才认为回合已在轮询间隙结束
-                if idle_ticks >= 2:
-                    return last, None
+                if keep_waiting and keep_waiting():
+                    idle_ticks = 0
+                else:
+                    idle_ticks += 1
+                    # 连续 2 轮（约 2×poll 秒）都未运行，才认为回合已在轮询间隙结束
+                    if idle_ticks >= 2:
+                        return last, None
             else:
                 idle_ticks = 0
             time.sleep(poll)

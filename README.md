@@ -15,8 +15,8 @@
 git clone https://github.com/br1nosense/dsh-wxauto-plugin.git
 cd dsh-wxauto-plugin
 
-# 2. 安装 Python 依赖（wxauto4 免费版）
-py -3 -m pip install wxauto4
+# 2. 安装 Python 依赖（wxauto4 免费版 + websocket-client：桥把 DSH 提问转发到微信需要它）
+py -3 -m pip install wxauto4 websocket-client
 
 # 3. 一键安装为 DSH 插件（注册到默认 web profile）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
@@ -36,7 +36,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 | 系统 | Windows 10/11 |
 | 微信 | 4.1.x 客户端（`C:\Program Files\Tencent\Weixin\Weixin.exe`），已登录 |
 | Python | 3.9–3.12（wxauto4 免费版要求） |
-| 依赖 | `pip install wxauto4`（自动拉取 comtypes/pywin32/pillow/psutil 等） |
+| 依赖 | `pip install wxauto4 websocket-client`（wxauto4 拉取 comtypes/pywin32/pillow/psutil 等；websocket-client 用于把 DSH 提问转发到微信） |
 
 已验证组合：微信客户端 **4.1.8.107** + `wxauto4 41.1.2` + Python 3.12.6。
 
@@ -44,7 +44,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 
 ```powershell
 # 1. 安装 Python 依赖
-py -3 -m pip install wxauto4
+py -3 -m pip install wxauto4 websocket-client
 
 # 2. 安装为 DSH 插件（bundle，注册到 web profile）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
@@ -143,6 +143,12 @@ dsh-wxauto-plugin/
 
 「DSH 截图发给用户」= `dsh-shot.ps1` 把会话状态（标题/统计/任务清单/最近对话）渲染成 PNG
 （`data/shots/`），再经微信发送；`/shot` 与任务完成推送自动完成。
+
+**DSH 提问转发（ask_user_question）**：agent 需要用户选择/回答时，桥会订阅 DSH 的
+events.mux，把问题+选项**推送到微信**（编号列出），你在微信里直接回复「选项编号/选项内容」
+（多问题用「序号: 答案」分行，回复 0 跳过，多选用逗号分隔）即可，回答会回填给 agent，
+任务继续执行、完成后照常推送结果。需安装 `websocket-client`；等待回答超时（默认 600 秒，
+配置 `question_timeout`）自动跳过。
 
 ## 监听实现说明
 

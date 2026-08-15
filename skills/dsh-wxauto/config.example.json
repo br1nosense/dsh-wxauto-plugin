@@ -14,6 +14,7 @@
   "bridge_chats": ["文件传输助手"],
   "bridge_poll_interval": 3,
   "bridge_force_interval": 30,
+  "question_timeout": 600,
   "bridge_state": "data/bridge_state.json",
   "bridge_log": "data/bridge.jsonl",
   "bridge_task_timeout": 900,

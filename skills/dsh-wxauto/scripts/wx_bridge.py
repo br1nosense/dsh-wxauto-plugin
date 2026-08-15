@@ -25,11 +25,21 @@ import atexit
 import faulthandler
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
 import time
 from datetime import datetime
+
+# 可选依赖：websocket-client（用于把 DSH 的 ask_user_question 提问转发到微信）。
+# 未安装时提问转发降级为不可用，桥其余功能不受影响。
+try:
+    from websocket import create_connection as _ws_create
+    from websocket import WebSocketTimeoutException as _WsTimeout
+    _HAS_WS = True
+except Exception:
+    _HAS_WS = False
 
 # 捕获原生层崩溃（COM/UIA 致命错误常导致静默退出）的 traceback
 faulthandler.enable()
@@ -93,6 +103,12 @@ class Bridge:
         self.reply_rules_file = resolve_path(cfg, "reply_rules_file", "data/reply_rules.json")
         self.wx = None
         self.lock = threading.RLock()  # 串行化所有微信 UI 操作（wxauto4 非线程安全）
+        # ask_user_question 转发状态（mux 监听线程 + 等待线程共享）
+        self._waits = {}        # session_id -> {chat, task}（桥正在等待完成的会话）
+        self._pending_q = {}    # session_id -> {rpc_id, questions, chat, asked_at}
+        self._mux_stop = threading.Event()
+        self._mux_url = None
+        self._question_timeout = int(cfg.get("question_timeout") or 600)
 
     def bind_wx(self, wx):
         self.wx = wx
@@ -265,6 +281,222 @@ class Bridge:
         except Exception as e:
             print(f"[bridge] 子进程发送文件异常 [{chat}] {path}: {type(e).__name__}: {e}", file=sys.stderr)
             return False
+
+    # ---- ask_user_question 转发：mux 监听 + 微信回答 ----
+    def _register_wait(self, session_id, chat, task):
+        with self.lock:
+            self._waits[session_id] = {"chat": chat, "task": task}
+
+    def _unregister_wait(self, session_id):
+        with self.lock:
+            self._waits.pop(session_id, None)
+            q = self._pending_q.pop(session_id, None)
+        if q:
+            self._cancel_pending(session_id, q)
+
+    def _has_pending_question(self, session_id):
+        with self.lock:
+            return session_id in self._pending_q
+
+    def _pending_question_for_chat(self, chat):
+        with self.lock:
+            for sid, q in list(self._pending_q.items()):
+                if q.get("chat") == chat:
+                    return sid, dict(q)
+        return None, None
+
+    def _cancel_pending(self, session_id, q):
+        try:
+            dsh = DshClient(base=self.base)
+            dsh.cancel_question(q["rpc_id"], session_id)
+        except Exception as e:
+            print(f"[bridge] 取消提问失败 {session_id}: {e}", file=sys.stderr)
+
+    def _format_questions(self, questions):
+        lines = ["📝 DSH 需要你选择/回答："]
+        for i, q in enumerate(questions, 1):
+            lines.append(f"\n【问题{i}】{q.get('question') or ''}")
+            if q.get("detail"):
+                lines.append(f"（{q.get('detail')}）")
+            opts = q.get("options") or []
+            for j, o in enumerate(opts, 1):
+                desc = o.get("description")
+                lines.append(f"  {j}. {o.get('label')}" + (f" —— {desc}" if desc else ""))
+            if q.get("multiSelect"):
+                lines.append("（可多选，用逗号分隔）")
+        lines.append("\n请直接回复：选项编号或选项内容；多问题用「序号: 答案」分行；回复 0 表示跳过。")
+        return "\n".join(lines)
+
+    def _handle_question(self, session_id, rpc_id, questions):
+        with self.lock:
+            wait = self._waits.get(session_id)
+            if not wait:
+                return  # 不是桥正在等待的会话，忽略
+            chat = wait["chat"]
+            old = self._pending_q.pop(session_id, None)
+        if old:
+            self._cancel_pending(session_id, old)
+        with self.lock:
+            self._pending_q[session_id] = {
+                "rpc_id": rpc_id, "questions": questions,
+                "chat": chat, "asked_at": time.time(),
+            }
+        print(f"[bridge] 检测到提问 session={session_id[:8]} chat={chat}，已转发微信", flush=True)
+        self.send_text(chat, self._format_questions(questions))
+
+    def _sweep_questions(self):
+        now = time.time()
+        stale = []
+        with self.lock:
+            for sid, q in list(self._pending_q.items()):
+                if now - q.get("asked_at", 0) > self._question_timeout:
+                    stale.append((sid, q))
+            for sid, q in stale:
+                self._pending_q.pop(sid, None)
+        for sid, q in stale:
+            print(f"[bridge] 提问超时（>{self._question_timeout}s）自动取消 {sid[:8]}", flush=True)
+            self._cancel_pending(sid, q)
+            try:
+                self.send_text(q.get("chat"), "⏰ 问题等待超时，已自动跳过，DSH 继续执行。")
+            except Exception:
+                pass
+
+    def _mux_loop(self):
+        if not self._mux_url:
+            return
+        print(f"[bridge] mux 监听启动：{self._mux_url}", flush=True)
+        while not self._mux_stop.is_set():
+            ws = None
+            try:
+                ws = _ws_create(self._mux_url, timeout=15)
+                ws.settimeout(5)
+                while not self._mux_stop.is_set():
+                    try:
+                        raw = ws.recv()
+                    except _WsTimeout:
+                        self._sweep_questions()
+                        continue
+                    except Exception:
+                        break  # 连接断开 → 重连
+                    try:
+                        full = json.loads(raw)
+                    except Exception:
+                        continue
+                    payload = full.get("payload") or {}
+                    if payload.get("type") != "question/requested":
+                        continue
+                    self._handle_question(payload.get("sessionId"),
+                                          full.get("rpcId"), payload.get("questions") or [])
+            except Exception as e:
+                print(f"[bridge] mux 异常：{type(e).__name__}: {e}", file=sys.stderr)
+            finally:
+                if ws is not None:
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+            self._sweep_questions()
+            if self._mux_stop.is_set():
+                break
+            time.sleep(3)
+        print("[bridge] mux 监听停止", flush=True)
+
+    def _parse_answer(self, content, question):
+        qid = question.get("id")
+        opts = question.get("options") or []
+        multi = bool(question.get("multiSelect"))
+        text = (content or "").strip()
+        if text.lower() in ("0", "跳过", "skip", "none", "-", "无", "不选"):
+            return {"id": qid, "selected": []}
+
+        def norm(s):
+            return re.sub(r"[\s。.，,：:、()（）\"'“”‘’]+", "", (s or "").lower())
+
+        def match(part):
+            part = (part or "").strip().strip(" .:：()（）\t")
+            if not part:
+                return None
+            if part.isdigit():
+                i = int(part)
+                if 1 <= i <= len(opts):
+                    return opts[i - 1].get("label")
+            pn = norm(part)
+            for o in opts:
+                lab = o.get("label") or ""
+                if lab and norm(lab) == pn:
+                    return lab
+                for sep in (":", "：", ".", "、", ")"):
+                    if sep in lab:
+                        head, _, tail = lab.partition(sep)
+                        if (tail and norm(tail) == pn) or (head and norm(head) == pn):
+                            return lab
+            return None
+
+        if multi:
+            parts = [p for p in re.split(r"[,，;；、]+", text) if p.strip()]
+            selected = []
+            for p in parts:
+                m = match(p)
+                if m and m not in selected:
+                    selected.append(m)
+            return {"id": qid, "selected": selected} if selected else {"id": qid, "custom": text}
+        m = match(text)
+        if m:
+            return {"id": qid, "selected": [m]}
+        return {"id": qid, "custom": text}
+
+    def _build_answers(self, content, questions):
+        if len(questions) == 1:
+            return [self._parse_answer(content, questions[0])]
+        answers = [{"id": q.get("id"), "selected": []} for q in questions]
+        lines = [ln.strip() for ln in (content or "").splitlines() if ln.strip()]
+        if not lines:
+            lines = [p.strip() for p in re.split(r"[;；]", content or "") if p.strip()]
+        for ln in lines:
+            m = re.match(r"^\s*(\d+)\s*[:：.．]\s*(.*)$", ln)
+            if m:
+                idx = int(m.group(1))
+                if 1 <= idx <= len(questions):
+                    answers[idx - 1] = self._parse_answer(m.group(2), questions[idx - 1])
+            else:
+                for i, q in enumerate(questions):
+                    a = answers[i]
+                    if not a.get("selected") and not a.get("custom"):
+                        answers[i] = self._parse_answer(ln, q)
+                        break
+        return answers
+
+    def try_answer_question(self, chat, content):
+        """把控制聊天的普通消息当作待回答问题的答案提交。消费掉返回 True。"""
+        sid, q = self._pending_question_for_chat(chat)
+        if not q:
+            return False
+        try:
+            answers = self._build_answers(content, q["questions"])
+            dsh = DshClient(base=self.base)
+            resp = dsh.answer_question(q["rpc_id"], sid, {"answers": answers})
+            accepted = bool(resp.get("accepted"))
+        except Exception as e:
+            print(f"[bridge] 提交答案异常 {sid[:8]}: {e}", file=sys.stderr)
+            try:
+                self.send_text(chat, f"提交答案出错：{e}，请重新回复。")
+            except Exception:
+                pass
+            return True
+        if accepted:
+            with self.lock:
+                self._pending_q.pop(sid, None)
+            try:
+                self.send_text(chat, "✅ 已收到你的回答，DSH 继续执行中…")
+            except Exception:
+                pass
+            print(f"[bridge] 已提交微信回答 chat={chat} accepted=True", flush=True)
+        else:
+            try:
+                self.send_text(chat, f"答案未通过校验（{resp.get('reason')}），请重新回复上面的问题。")
+            except Exception:
+                pass
+        return True
 
     # ---- 会话信息 ----
     def _info(self, sid, max_msgs=6):
@@ -445,10 +677,14 @@ class Bridge:
 
     def _wait_and_push(self, chat, sid, task, from_seq):
         dsh = DshClient(base=self.base)
+        self._register_wait(sid, chat, task)
         try:
             # 关键：必须把 from_seq 传给 wait_turn_end —— 否则它会匹配到会话里更早的
             # 旧回合 turn/end，任务还没跑完就提前返回，导致「任务没完成却推送了完成」。
-            _, reason = dsh.wait_turn_end(sid, timeout=self.timeout, from_seq=from_seq)
+            # keep_waiting：等用户回答 ask_user_question 提问时顺延超时，不误判结束。
+            _, reason = dsh.wait_turn_end(
+                sid, timeout=self.timeout, from_seq=from_seq,
+                keep_waiting=lambda: self._has_pending_question(sid))
             h = dsh.history(sid, max_messages=60)
             msgs = extract_messages(h.get("events") or [])
             new_asst = [m for m in msgs if m["role"] == "assistant" and m["seq"] > from_seq]
@@ -490,6 +726,8 @@ class Bridge:
                 self.send_text(chat, f"任务执行出错：{e}")
             except Exception:
                 pass
+        finally:
+            self._unregister_wait(sid)
 
 
 def load_seen(path):
@@ -726,6 +964,15 @@ def main():
                                  args=(p["chat"], p["sid"], p["task"], p.get("from_seq", 0)), daemon=True)
             t.start()
 
+    # ask_user_question 转发：订阅 DSH events.mux，把提问推送到微信并接收回答。
+    # 仅 full 模式；未安装 websocket-client 时降级（桥其余功能不受影响）。
+    bridge._mux_url = f"{bridge.base.replace('https://', 'wss://').replace('http://', 'ws://')}/api/events.mux"
+    bridge._question_timeout = int(cfg.get("question_timeout") or 600)
+    if mode == "full" and _HAS_WS:
+        threading.Thread(target=bridge._mux_loop, daemon=True).start()
+    elif mode == "full":
+        print("[bridge] ⚠️ 未安装 websocket-client，无法把 DSH 提问转发到微信（pip install websocket-client）", file=sys.stderr)
+
     reply_rules = bridge.load_reply_rules()
     reply_reload_at = time.time() + 60  # 每分钟重载规则，编辑即时生效
 
@@ -760,7 +1007,11 @@ def main():
                         print(f"[bridge] → file {payload} ok={ok}", flush=True)
                 continue
 
-            # 2) 关键词自动回复（整合 wx_listen；命中则不当作任务）
+            # 2) 待回答的 DSH 提问：普通消息当作答案提交（优先于关键词/任务）
+            if bridge.try_answer_question(rec["chat"], content):
+                continue
+
+            # 3) 关键词自动回复（整合 wx_listen；命中则不当作任务）
             reply = None
             for kw, rtext in (reply_rules or {}).items():
                 if kw and kw in content:
@@ -772,7 +1023,7 @@ def main():
                 print(f"[bridge] → 自动回复 ok={ok}", flush=True)
                 continue
 
-            # 3) 普通消息：full 模式当任务；listen 模式仅记录（bridge.jsonl 已写）
+            # 4) 普通消息：full 模式当任务；listen 模式仅记录（bridge.jsonl 已写）
             if mode == "full":
                 for kind, payload in bridge.handle(rec["chat"], content):
                     if kind == "text":
@@ -846,6 +1097,7 @@ def main():
     except KeyboardInterrupt:
         print("\n[bridge] 已停止。", file=sys.stderr)
     finally:
+        bridge._mux_stop.set()
         save_seen(seen_file, seen)
     return 0
 
