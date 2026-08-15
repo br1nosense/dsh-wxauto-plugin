@@ -103,9 +103,13 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File <skill目录>\wrappers\w
 ```
 
 监听行为：
-- 新消息**逐条追加**到 JSONL 日志（默认 `<skill目录>\data\listen.jsonl`），每行一条 JSON：`{ts, chat, chat_type, attr, type, sender, content, reply_sent?, reply?}`。
+- 新消息**逐条追加**到 JSONL 日志（默认 `<skill目录>\data\listen.jsonl`），每行一条 JSON：`{ts, chat, chat_type, attr, type, sender, content, at?, reply_sent?, reply?}`。
 - 每收到一条新消息会在 stdout 打印一行（后台任务可捕获）。
+- **去重**：消息去重键为 `(chat, sender, type, content, hash|id)` —— 追加了 wxauto4 的消息稳定标识（`msg.hash` 切换 UI 不变，`msg.id` 窗口内唯一），
+  因此**同一人连发两条相同内容的消息都会被受理**（旧实现只按内容去重会漏掉第二条），同时跨窗口/重启不重复受理。
+  升级后首次重启可能把升级前窗口内可见的旧消息再受理一次（旧键格式不匹配，一次性，可接受）。
 - **关键词自动回复**：编辑 `<skill目录>\data\reply_rules.json`（示例见 `data\reply_rules.example.json`），格式 `{ "关键词": "回复文本" }`，回复支持 `{who}{sender}{content}` 占位。匹配到且发送者为好友/群友时，自动回一条消息；同一条消息只回一次。
+- 群聊里的关键词自动回复同样受**群聊策略**约束（白名单 `group_whitelist` + 仅响应 @ 我 `group_mention_only`）；**消息记录不受影响**，照常写入 JSONL。
 - 忽略自动回复造成的「自己发的消息」（`attr=self`），不会自触发。
 
 agent 读取监听结果的方式：
@@ -128,6 +132,10 @@ agent 读取监听结果的方式：
 - `bridge_chats`：桥的控制聊天（`-Who` 缺省时使用）
 - `bridge_poll_interval` / `bridge_task_timeout`：桥轮询间隔 / 任务等待超时（秒）
 - `bridge_state` / `bridge_log` / `shots_dir`：桥状态、日志、截图目录
+- `group_whitelist`：群聊白名单（数组）。**白名单内的群会自动加入轮询/监听**（无需再写进 bridgeChats/listenChats），
+  并只有白名单内的群才会被响应；空 = 不限制（所有被监听的群按 @ 策略处理）
+- `group_mention_only`：群聊仅响应 @ 我的消息（默认 true；回答桥发起的提问不受限）
+- `my_aliases`：我的昵称别名（数组，群名片等），@ 检测用；留空自动取 GetMyInfo 昵称
 
 ### 6.1 优先在 DSH 设置里配置（插件已注册 `wxauto` 命名空间）
 
@@ -142,6 +150,9 @@ agent 读取监听结果的方式：
 | `targetChats` | 汇报目标聊天 | `target_chats` |
 | `listenChats` | 监听聊天 | `listen_chats` |
 | `dshBase` / `cwd` / `listenInterval` / `taskTimeout` / `autoReport` / `reportPrefix` / `reportTail` | 同 config.json 字段 | 对应 snake_case |
+| `groupWhitelist` | 群聊白名单 | `group_whitelist` |
+| `groupMentionOnly` | 群聊仅响应 @ 我（默认 true） | `group_mention_only` |
+| `myAliases` | 我的昵称别名（@ 检测用） | `my_aliases` |
 
 优先级：**DSH 设置（settings.yaml / 设置页）> config.json > 内置默认**。
 改设置即时生效（热重载）；Python 侧由插件镜像到 `data/dsh_settings.json` 读取。
@@ -189,6 +200,13 @@ agent 读取监听结果的方式：
   不会误匹配旧回合而提前返回；推送时按 `turn/end` 的 reason 如实标注：`completed` 才发「✅ 任务完成」，
   `aborted/cancelled` 发「⚠️ 任务被取消」，`error/blocked/max-tokens/interrupted` 发「❌ 任务未完成」，
   未确认时发「⚠️ 已结束但未确认完成」，绝不假装成功。
+- **群聊策略（白名单 + @ 响应）**：白名单（`group_whitelist`）内的群**会自动加入轮询/监听**（无需再写进
+  `bridgeChats`/`listenChats`）；开启 `group_mention_only`（默认）时，群聊里只有 **@ 你** 的消息才会被受理
+  （命令/自动回复/任务），避免控制群一活跃就刷屏。群聊发「@机器人 /list」即可命令（桥自动剥掉开头 @ 前缀）。
+  回答桥发起的提问不受此限制；群消息照常记录日志，只是不响应。识别不到你的昵称时会告警
+  （可在设置 `myAliases` 配置群名片等昵称别名）。
+  ⚠️ 首次把某个群加入白名单后，群里**已有的可见消息**会被当作新消息受理一遍（含 @ 你的历史消息），
+  建议用新群测试或先清空。
 - **占用提示**：运行期间会**占用本机微信窗口**，**期间请勿手动操作微信**。启动时打印醒目警告；用完后关闭对应开关即恢复。
 - **省鼠标设计**：轮询间隔默认 8s；`GetSession` 查新消息不切窗，仅在"有新消息且窗口不在控制聊天"时才切换；发送时窗口已在目标聊天则跳过 ChatWith；`resize=False` 不重置窗口。
 - **兜底强读（防止「开了监听却没反应」）**：控制聊天是用户明确指定的，不能只靠 `GetSession` 的 `isnew` 标记 —— 被微信折叠进「折叠的聊天」的会话，`GetSession` 顶层列表里看不到（拿不到 `isnew`），若不兜底就会永远跳过、收到消息没反应。桥会**每 `bridge_force_interval` 秒（默认 30）强制 `ChatWith` 切过去读一次** `GetAllMessage`，保证这类聊天的新消息也能被捕获并受理。

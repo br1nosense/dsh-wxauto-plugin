@@ -23,8 +23,12 @@ import wx_common
 from wx_common import (
     SingleInstance,
     add_common_args,
+    capture_at,
+    is_group_chat,
     load_config,
+    mentioned_me,
     out_json,
+    resolve_my_aliases,
     resolve_path,
     wx_init,
     UI_Lock,
@@ -51,13 +55,28 @@ def load_reply_rules(path):
 
 
 def msg_key(m, chat):
+    """生成消息去重键（P0 修复）。
+
+    原实现 (chat, sender, type, content) 缺少消息自身的唯一维度：同一人连发
+    两条相同内容的消息会被 seen 漏掉第二条。修复：追加消息稳定标识
+    msg.hash（切换 UI 不变，跨重启去重可靠）与 msg.id（窗口内唯一，同内容
+    不同消息 id 不同，保证连发都受理）的组合。两者都拿不到时退化为原键。
+    """
     try:
         content = getattr(m, "content", "") or ""
     except Exception:
         content = ""
     sender = getattr(m, "sender", "") or ""
     mtype = getattr(m, "type", "") or ""
-    return (chat, sender, mtype, content)
+    stable = []
+    for attr in ("hash", "id"):
+        try:
+            v = getattr(m, attr, None)
+            if v:
+                stable.append(f"{attr}:{v}")
+        except Exception:
+            continue
+    return (chat, sender, mtype, content, "|".join(stable))
 
 
 def new_seen(maxlen=500):
@@ -65,11 +84,15 @@ def new_seen(maxlen=500):
     return deque(maxlen=maxlen)
 
 
-def poll_once(wx, targets, seen, log_file, reply_rules, replied, chat_type_cache):
+def poll_once(wx, targets, seen, log_file, reply_rules, replied, chat_type_cache,
+              group_whitelist=None, group_mention_only=False, my_aliases=None):
     """单次轮询。返回本次捕获的新消息列表。
 
     整个轮询（切窗/读消息/自动回复）持有跨进程 UI 锁，与桥/发送互斥，
     避免并发抢占微信窗口导致「发送假成功」或抢鼠标。
+
+    群聊策略（P0）：记录照常写入日志；自动回复需过「白名单 + @ 我」
+    （group_mention_only 开启时）。未通过时标记 reply_skipped 而不回复。
     """
     with UI_Lock():
         captured = []
@@ -131,6 +154,10 @@ def poll_once(wx, targets, seen, log_file, reply_rules, replied, chat_type_cache
                     "sender": sender,
                     "content": content,
                 }
+                # 尽力提取 @ 名单（群聊 @ 检测用；失败忽略）
+                at_names = capture_at(m)
+                if at_names:
+                    record["at"] = at_names
                 captured.append(record)
 
                 # 写入 JSONL
@@ -141,24 +168,32 @@ def poll_once(wx, targets, seen, log_file, reply_rules, replied, chat_type_cache
                 except Exception as e:
                     print(f"[wx] 写日志失败：{e}", file=sys.stderr)
 
-                # 关键词自动回复（仅好友/群友发来的消息）
+                # 关键词自动回复（仅好友/群友发来的消息；群聊需过白名单 + @ 策略）
                 if attr == "friend" and reply_rules:
-                    reply = None
-                    for kw, rtext in reply_rules.items():
-                        if kw and kw in content:
-                            reply = rtext
-                            break
-                    if reply is not None:
-                        rkey = (target, key)
-                        if rkey not in replied:
-                            try:
-                                text = reply.replace("{who}", target).replace("{sender}", sender).replace("{content}", content)
-                                wx.SendMsg(msg=text, who=target, clear=True, exact=True)
-                                record["reply_sent"] = True
-                                record["reply"] = text
-                                replied.add(rkey)
-                            except Exception as e:
-                                record["reply_error"] = str(e)
+                    allow_reply = True
+                    if is_group_chat(record):
+                        in_wl = (not group_whitelist) or (target in group_whitelist)
+                        mentioned = (not group_mention_only) or mentioned_me(content, my_aliases, record.get("at"))
+                        allow_reply = in_wl and mentioned
+                        if not allow_reply:
+                            record["reply_skipped"] = "group_policy"  # 记录照常，仅不回复
+                    if allow_reply:
+                        reply = None
+                        for kw, rtext in reply_rules.items():
+                            if kw and kw in content:
+                                reply = rtext
+                                break
+                        if reply is not None:
+                            rkey = (target, key)
+                            if rkey not in replied:
+                                try:
+                                    text = reply.replace("{who}", target).replace("{sender}", sender).replace("{content}", content)
+                                    wx.SendMsg(msg=text, who=target, clear=True, exact=True)
+                                    record["reply_sent"] = True
+                                    record["reply"] = text
+                                    replied.add(rkey)
+                                except Exception as e:
+                                    record["reply_error"] = str(e)
 
                 # 打印一条（人类可读）
                 emoji = MSG_EMOJI.get(mtype, "🔹")
@@ -185,8 +220,13 @@ def main():
         print("错误：监听开关未开启：请在 DSH 设置（wxauto → listenEnabled）打开，或用 --force 临时启动。", file=sys.stderr)
         return 1
     targets = [t.strip() for t in (args.who or ",".join(cfg.get("listen_chats") or [])).split(",") if t.strip()]
+    # 群聊白名单的群自动加入监听（白名单 = 允许响应的群，同时也被监听）
+    for g in (cfg.get("group_whitelist") or []):
+        g = str(g).strip()
+        if g and g not in targets:
+            targets.append(g)
     if not targets:
-        out_text("错误：未指定监听聊天（--who 或配置 listen_chats）。")
+        out_text("错误：未指定监听聊天（--who 或配置 listen_chats，或群聊白名单 group_whitelist）。")
         return 1
     # 互斥守卫：桥已在轮询这些聊天时，监听不重复轮询（双进程同时操作微信窗口 = 抢鼠标翻倍）
     if not args.force and cfg.get("bridge_enabled"):
@@ -215,13 +255,23 @@ def main():
         return 0  # 正常退出码：手动 wx-listen.ps1 看护不会因此反复重启
 
     wx = wx_init(debug=args.debug)
+    # 群聊策略（P0）：白名单 + @ 响应（仅作用于自动回复；记录不受限）
+    group_whitelist = [str(x).strip() for x in (cfg.get("group_whitelist") or []) if str(x).strip()]
+    group_mention_only = bool(cfg.get("group_mention_only", True))
+    my_aliases = resolve_my_aliases(wx, cfg.get("my_aliases"))
+    if group_mention_only and not my_aliases:
+        print("⚠️ 群聊 @ 策略已开启但无法确定你的昵称（GetMyInfo 为空且未配置 my_aliases）："
+              "群聊消息将不会自动回复。可在 DSH 设置 wxauto → myAliases 配置昵称别名。", file=sys.stderr)
     print("⚠️ 监听运行期间会打开微信聊天窗口读取消息，可能干扰手动操作微信；"
           "完成后在 DSH 设置关闭 wxauto → listenEnabled 即停止。", flush=True)
     print(f"[wx] 监听中：{', '.join(targets)}（轮询间隔 {interval}s，日志 {log_file}）"
-          + (f"，自动回复规则 {len(reply_rules)} 条" if reply_rules else ""), flush=True)
+          + (f"，自动回复规则 {len(reply_rules)} 条" if reply_rules else "")
+          + (f"，群聊策略：白名单={group_whitelist or '不限'}，{'仅 @ 我' if group_mention_only else '全部'}"
+             if group_whitelist or group_mention_only else ""), flush=True)
 
     if args.once:
-        captured = poll_once(wx, targets, seen, log_file, reply_rules, replied, chat_type_cache)
+        captured = poll_once(wx, targets, seen, log_file, reply_rules, replied, chat_type_cache,
+                             group_whitelist, group_mention_only, my_aliases)
         if args.json:
             out_json({"ok": True, "captured": captured})
         return 0
@@ -230,7 +280,8 @@ def main():
     deadline = time.time() + args.timeout if args.timeout > 0 else None
     try:
         while True:
-            poll_once(wx, targets, seen, log_file, reply_rules, replied, chat_type_cache)
+            poll_once(wx, targets, seen, log_file, reply_rules, replied, chat_type_cache,
+                      group_whitelist, group_mention_only, my_aliases)
             if deadline and time.time() >= deadline:
                 print(f"[wx] 已达 --timeout {args.timeout}s，退出。", flush=True)
                 break

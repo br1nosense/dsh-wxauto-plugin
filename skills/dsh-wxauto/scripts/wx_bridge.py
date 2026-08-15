@@ -53,9 +53,14 @@ from dsh_html_card import render_progress_card
 from wx_common import (
     SingleInstance,
     add_common_args,
+    capture_at,
+    is_group_chat,
     load_config,
+    mentioned_me,
     out_json,
+    resolve_my_aliases,
     resolve_path,
+    strip_mention_prefix,
     wx_init,
     UI_Lock,
 )
@@ -72,7 +77,8 @@ HELP_TEXT = (
     "/task <内容> - 执行任务\n"
     "/cancel - 取消当前回合\n"
     "/help - 帮助\n"
-    "直接发普通消息 = 把内容作为任务交给 DSH 执行"
+    "直接发普通消息 = 把内容作为任务交给 DSH 执行\n"
+    "群聊中需 @ 我（且在白名单内）才会响应；可在设置调整 groupMentionOnly / groupWhitelist"
 )
 
 
@@ -109,6 +115,11 @@ class Bridge:
         self._mux_stop = threading.Event()
         self._mux_url = None
         self._question_timeout = int(cfg.get("question_timeout") or 600)
+        # 群聊策略（P0）：白名单 + @ 响应。群聊消息需在白名单内且（开启时）@ 我才受理；
+        # 回答桥发起的提问不受限。白名单为空 = 不限制（所有被监听的群按 @ 策略处理）。
+        self.group_whitelist = [str(x).strip() for x in (cfg.get("group_whitelist") or []) if str(x).strip()]
+        self.group_mention_only = bool(cfg.get("group_mention_only", True))
+        self.my_aliases = [str(x).strip() for x in (cfg.get("my_aliases") or []) if str(x).strip()]
 
     def bind_wx(self, wx):
         self.wx = wx
@@ -731,7 +742,11 @@ class Bridge:
 
 
 def load_seen(path):
-    """加载上次已处理的消息键（跨重启去重）。JSON 存的是数组，需还原为可哈希元组。"""
+    """加载上次已处理的消息键（跨重启去重）。JSON 存的是数组，需还原为可哈希元组。
+
+    P0 修复：key 现在是 5 元组（含 hash|id 稳定标识），不再截断为前 4 项。
+    兼容旧格式：4 元组（旧键）补空稳定位，避免升级后把旧消息重复受理。
+    """
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -739,7 +754,10 @@ def load_seen(path):
             keys = set()
             for item in data:
                 if isinstance(item, (list, tuple)) and len(item) >= 4:
-                    keys.add(tuple(item[:4]))
+                    t = tuple(item)
+                    if len(t) < 5:  # 旧 4 元组 → 补第 5 位（空稳定标识）
+                        t = t + ("",)
+                    keys.add(t)
             return keys
     except (FileNotFoundError, json.JSONDecodeError):
         pass
@@ -855,6 +873,13 @@ def poll_control_chats(wx, chats, seen, seen_file, log_file, chat_type_cache, la
                 "sender": sender,
                 "content": content,
             }
+            # 尽力提取 @ 名单（群聊 @ 检测用；失败忽略）
+            try:
+                atn = capture_at(m)
+                if atn:
+                    rec["at"] = atn
+            except Exception:
+                pass
             captured.append(rec)
             try:
                 os.makedirs(os.path.dirname(log_file) or ".", exist_ok=True)
@@ -892,6 +917,9 @@ def main():
             "listen_enabled": bool(cfg.get("listen_enabled")),
             "bridge_chats": cfg.get("bridge_chats") or [],
             "listen_chats": cfg.get("listen_chats") or [],
+            "group_whitelist": cfg.get("group_whitelist") or [],
+            "group_mention_only": bool(cfg.get("group_mention_only", True)),
+            "my_aliases": cfg.get("my_aliases") or [],
         })
         return 0
 
@@ -910,8 +938,14 @@ def main():
     else:
         default_chats = cfg.get("bridge_chats") or (cfg.get("listen_chats") or [])
     chats = [c.strip() for c in (args.who or ",".join(default_chats)).split(",") if c.strip()]
+    # 群聊白名单的群自动加入轮询（白名单 = 允许响应的群，同时也被监听）。
+    # 否则用户只填 groupWhitelist 时群消息根本不会被轮询到（实测踩坑点）。
+    for g in (cfg.get("group_whitelist") or []):
+        g = str(g).strip()
+        if g and g not in chats:
+            chats.append(g)
     if not chats:
-        out_json({"ok": False, "error": f"未指定聊天（--who 或配置 {'listen_chats' if mode=='listen' else 'bridge_chats'}）"})
+        out_json({"ok": False, "error": f"未指定聊天（--who 或配置 {'listen_chats' if mode=='listen' else 'bridge_chats'}，或群聊白名单 group_whitelist）"})
         return 1
     interval = args.interval if args.interval is not None else float(cfg.get("bridge_poll_interval") or cfg.get("listen_interval") or 8)
     state_path = args.state or resolve_path(cfg, "bridge_state", "data/bridge_state.json")
@@ -946,6 +980,14 @@ def main():
 
     wx = wx_init(debug=args.debug)
     bridge.bind_wx(wx)
+    # 群聊策略：解析「我」的昵称别名（@ 检测用），并打印策略状态
+    bridge.my_aliases = resolve_my_aliases(wx, bridge.my_aliases)
+    if bridge.group_mention_only and not bridge.my_aliases:
+        print("[bridge] ⚠️ 群聊 @ 策略已开启但无法确定你的昵称（GetMyInfo 为空且未配置 my_aliases）："
+              "群聊消息将不会响应。可在 DSH 设置 wxauto → myAliases 配置昵称别名。", file=sys.stderr)
+    print(f"[bridge] 群聊策略：白名单={bridge.group_whitelist or '不限'}，"
+          f"{'仅响应 @ 我' if bridge.group_mention_only else '响应全部消息'}（我的昵称别名：{bridge.my_aliases or '未知'}）",
+          flush=True)
     # 预读当前可见消息为已处理：仅首次运行（seen 文件不存在）才做，
     # 重启时 seen 已持久化，无需再切窗口（避免抢鼠标）
     if not seen_file_existed:
@@ -994,10 +1036,26 @@ def main():
                 continue  # system/time/other 等忽略，避免把时间戳当任务
             if rec.get("chat") not in chats:
                 continue
+
+            # 群聊策略（P0）：白名单 + @ 响应。回答桥发起的提问豁免；
+            # 消息记录已由轮询写入日志，这里只决定「是否响应」。
+            group = is_group_chat(rec)
+            eligible = True
+            if group:
+                if bridge.group_whitelist and rec["chat"] not in bridge.group_whitelist:
+                    eligible = False
+                elif bridge.group_mention_only and not mentioned_me(content, bridge.my_aliases, rec.get("at")):
+                    eligible = False
+                else:
+                    # 通过策略：去掉开头的 @我的昵称，命令/回答才能解析
+                    content = strip_mention_prefix(content, bridge.my_aliases)
             print(f"[bridge] ← [{rec['chat']}] {content}", flush=True)
 
-            # 1) / 命令（两种模式都支持）
+            # 1) / 命令（两种模式都支持；群聊未通过策略则忽略）
             if content.startswith("/"):
+                if not eligible:
+                    print(f"[bridge] 群聊 {rec['chat']} 未通过策略（未 @ 我或不在白名单），忽略命令", flush=True)
+                    continue
                 for kind, payload in bridge.handle(rec["chat"], content):
                     if kind == "text":
                         ok = bridge.send_text(rec["chat"], payload)
@@ -1007,8 +1065,13 @@ def main():
                         print(f"[bridge] → file {payload} ok={ok}", flush=True)
                 continue
 
-            # 2) 待回答的 DSH 提问：普通消息当作答案提交（优先于关键词/任务）
+            # 2) 待回答的 DSH 提问：普通消息当作答案提交（优先于关键词/任务；不受群聊策略限制）
             if bridge.try_answer_question(rec["chat"], content):
+                continue
+
+            # 群聊未通过策略：不自动回复、不当任务（仅记录）
+            if not eligible:
+                print(f"[bridge] 群聊 {rec['chat']} 未通过策略，忽略消息（仅记录）", flush=True)
                 continue
 
             # 3) 关键词自动回复（整合 wx_listen；命中则不当作任务）

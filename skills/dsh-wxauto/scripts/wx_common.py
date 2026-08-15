@@ -9,6 +9,7 @@
 import argparse
 import json
 import os
+import re
 import sys
 import time
 
@@ -193,6 +194,10 @@ DEFAULT_CONFIG = {
     "bridge_seen": "data/bridge_seen.json",
     "bridge_pending": "data/bridge_pending.json",
     "bridge_force_interval": 30,
+    # 群聊策略：白名单 + @ 响应（P0）
+    "group_whitelist": [],
+    "group_mention_only": True,
+    "my_aliases": [],
 }
 
 # DSH 设置（插件写 data/dsh_settings.json，schema 字段 camelCase）→ 本技能 config 字段（snake_case）
@@ -210,6 +215,9 @@ DSH_SETTINGS_MAP = {
     "enabled": "enabled",            # 总开关（单一 switch）
     "bridgeEnabled": "bridge_enabled",  # 旧字段兼容
     "listenEnabled": "listen_enabled",  # 旧字段兼容
+    "groupWhitelist": "group_whitelist",    # 群聊白名单
+    "groupMentionOnly": "group_mention_only",  # 群聊仅响应 @ 我
+    "myAliases": "my_aliases",              # 我的昵称别名（@ 检测用）
 }
 
 
@@ -264,6 +272,109 @@ def resolve_path(cfg, key, default_rel):
     if not os.path.isabs(raw):
         raw = os.path.join(SKILL_ROOT, raw)
     return os.path.normpath(raw)
+
+
+# ---- 群聊识别与 @ 响应策略（P0） ----
+# wxauto4 中 ChatInfo()/chat_info()['chat_type']：好友 'friend'、群聊 'group'、
+# 客服 'service'、公众号 'official'。4.x 群消息的 sender 只是发送人显示名
+# （不含群名前缀），因此以 chat_type 为准，不能靠冒号判断。
+GROUP_CHAT_TYPES = {"group", "群聊"}
+
+
+def is_group_chat(rec):
+    """判断消息记录是否来自群聊。
+
+    以 chat_type 为准（'group' 为群聊）；chat_type 缺失时兜底按 3.x 的
+    「群名:昵称」sender 风格判断。
+    """
+    ctype = str((rec or {}).get("chat_type") or "")
+    if ctype:
+        return ctype in GROUP_CHAT_TYPES
+    sender = str((rec or {}).get("sender") or "")
+    return ":" in sender or "：" in sender
+
+
+def mentioned_me(content, aliases, at_list=None):
+    """判断群消息是否 @ 了我：内容中出现 @昵称（微信把 @ 渲染成文本，实测有效）。
+
+    at_list 通道已废弃（FriendMessage.at 是 UI 动作，见 capture_at），保留参数
+    仅为兼容。aliases 取 resolve_my_aliases 的结果（GetMyInfo 昵称 + 配置
+    my_aliases）。别名缺省为空时返回 False（无法判断 → 不响应，安全方向）。
+    """
+    if not aliases:
+        return False
+    content = content or ""
+    for alias in aliases:
+        alias = (alias or "").strip()
+        if not alias:
+            continue
+        if re.search(r"@\s*" + re.escape(alias), content):
+            return True
+    for name in (at_list or []):
+        name = str(name or "").strip()
+        if name and name in aliases:
+            return True
+    return False
+
+
+def capture_at(m):
+    """（废弃通道）提取消息中被 @ 的人名列表。
+
+    实测（wxauto4 41.1.2）：FriendMessage.at 是「UI 操作动作」而非获取器——
+    at(content) 返回 WxResponse（status: 成功），可能触发微信 UI 操作，有副作用，
+    不能在生产代码里调用。@ 检测请完全依赖内容（content 里含 "@昵称" 文本，
+    实测 '@白无意\\u2005今天天气怎么样'）。本函数恒返回 [] 以保留调用点兼容。
+    """
+    return []
+
+
+def strip_mention_prefix(content, aliases):
+    """去掉消息开头的 @我的昵称（仅精确匹配别名，最多剥 3 个），返回剩余内容。
+
+    群聊里「@机器人 /list」「@机器人 1」这类消息，剥掉开头 @ 前缀后命令/回答
+    才能被正确解析。只剥精确匹配别名的 @，避免误删 @别人的内容。
+    """
+    c = content or ""
+    names = {a.strip() for a in (aliases or []) if a and a.strip()}
+    for _ in range(3):
+        m = re.match(r"^\s*@\s*([^\s@]+)\s*", c)
+        if not m or m.group(1) not in names:
+            break
+        c = c[m.end():]
+    return c.strip()
+
+
+def resolve_my_aliases(wx, configured=None):
+    """解析「我」的昵称别名列表（群聊 @ 检测用）。
+
+    配置 my_aliases 优先，再补 GetMyInfo() 与 wx.nickname（自动去重）。
+    拿不到昵称时可能返回空列表（@ 检测不可用，调用方应告警）。
+    """
+    aliases = []
+    seen = set()
+    for a in (configured or []):
+        a = str(a).strip()
+        if a and a not in seen:
+            seen.add(a)
+            aliases.append(a)
+    try:
+        info = wx.GetMyInfo() or {}
+        # 实测（wxauto4 41.1.2）：GetMyInfo 返回 {'display_name': 昵称, 'id': ..., 'region': ...}
+        for k in ("display_name", "name", "nickname", "nick"):
+            v = info.get(k)
+            if v and str(v).strip() and str(v).strip() not in seen:
+                seen.add(str(v).strip())
+                aliases.append(str(v).strip())
+    except Exception:
+        pass
+    try:
+        nick = getattr(wx, "nickname", None)
+        if nick and str(nick).strip() and str(nick).strip() not in seen:
+            seen.add(str(nick).strip())
+            aliases.append(str(nick).strip())
+    except Exception:
+        pass
+    return aliases
 
 
 def out_json(obj):

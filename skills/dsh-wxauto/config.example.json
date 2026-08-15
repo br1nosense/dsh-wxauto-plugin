@@ -18,5 +18,9 @@
   "bridge_state": "data/bridge_state.json",
   "bridge_log": "data/bridge.jsonl",
   "bridge_task_timeout": 900,
-  "shots_dir": "data/shots"
+  "shots_dir": "data/shots",
+
+  "group_whitelist": [],
+  "group_mention_only": true,
+  "my_aliases": []
 }
