@@ -12,7 +12,7 @@
 
 ```powershell
 # 1. 克隆仓库
-git clone https://github.com/<你的GitHub用户名>/dsh-wxauto-plugin.git
+git clone https://github.com/br1nosense/dsh-wxauto-plugin.git
 cd dsh-wxauto-plugin
 
 # 2. 安装 Python 依赖（wxauto4 免费版）
