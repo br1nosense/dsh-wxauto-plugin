@@ -22,5 +22,6 @@
 
   "group_whitelist": [],
   "group_mention_only": true,
-  "my_aliases": []
+  "my_aliases": [],
+  "sender_whitelist": []
 }

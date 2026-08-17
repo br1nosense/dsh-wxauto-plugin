@@ -198,6 +198,11 @@ DEFAULT_CONFIG = {
     "group_whitelist": [],
     "group_mention_only": True,
     "my_aliases": [],
+    # 群聊发送者白名单（P0 安全）：群聊里只有白名单内的成员能驱动 agent
+    # （发 /命令、直接发普通消息当任务）。空列表 = 未配置 → 群聊默认拒绝所有成员驱动
+    # （安全方向，防止群里任何人 @ 你就能操控 agent）；配置 ["*"] = 显式开放
+    # （不做 sender 鉴权，所有 @ 都接受，兼容旧行为）。
+    "sender_whitelist": [],
 }
 
 # DSH 设置（插件写 data/dsh_settings.json，schema 字段 camelCase）→ 本技能 config 字段（snake_case）
@@ -218,6 +223,7 @@ DSH_SETTINGS_MAP = {
     "groupWhitelist": "group_whitelist",    # 群聊白名单
     "groupMentionOnly": "group_mention_only",  # 群聊仅响应 @ 我
     "myAliases": "my_aliases",              # 我的昵称别名（@ 检测用）
+    "senderWhitelist": "sender_whitelist",  # 群聊发送者白名单（P0 安全）
 }
 
 

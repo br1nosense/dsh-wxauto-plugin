@@ -75,7 +75,9 @@ HELP_TEXT = (
     "/shot - 发送进度截图\n"
     "/history [n] - 最近对话\n"
     "/task <内容> - 执行任务\n"
-    "/cancel - 取消当前回合\n"
+    "/cancel - 取消当前会话回合\n"
+    "/stop - 终止当前会话任务（取消+清理待推送）\n"
+    "/stopall - 终止本聊天所有卡死任务（含已归档会话）\n"
     "/help - 帮助\n"
     "直接发普通消息 = 把内容作为任务交给 DSH 执行\n"
     "群聊中需 @ 我（且在白名单内）才会响应；可在设置调整 groupMentionOnly / groupWhitelist"
@@ -109,17 +111,39 @@ class Bridge:
         self.reply_rules_file = resolve_path(cfg, "reply_rules_file", "data/reply_rules.json")
         self.wx = None
         self.lock = threading.RLock()  # 串行化所有微信 UI 操作（wxauto4 非线程安全）
+        self._last_text = {}  # chat -> (text, ts)：短窗口防重复发送（P0 修复）
         # ask_user_question 转发状态（mux 监听线程 + 等待线程共享）
         self._waits = {}        # session_id -> {chat, task}（桥正在等待完成的会话）
         self._pending_q = {}    # session_id -> {rpc_id, questions, chat, asked_at}
+        self._last_question_rpc = {}  # session_id -> rpc_id：提问转发去重（P0）
         self._mux_stop = threading.Event()
         self._mux_url = None
         self._question_timeout = int(cfg.get("question_timeout") or 600)
-        # 群聊策略（P0）：白名单 + @ 响应。群聊消息需在白名单内且（开启时）@ 我才受理；
-        # 回答桥发起的提问不受限。白名单为空 = 不限制（所有被监听的群按 @ 策略处理）。
+        # 群聊策略（P0）：白名单 + @ 响应 + 发送者鉴权。群聊消息需在群白名单内、
+        # （开启时）@ 我才受理，且发送者必须在 sender_whitelist 内。
+        # 回答桥发起的提问不受限。群白名单为空 = 不限制（所有被监听的群按 @ 策略处理）。
+        # sender_whitelist（P0 安全）：空 = 未配置 → 群聊默认拒绝所有成员驱动 agent；
+        # ["*"] = 显式开放（不做 sender 鉴权）；具体昵称列表 = 只允许名单内的人。
         self.group_whitelist = [str(x).strip() for x in (cfg.get("group_whitelist") or []) if str(x).strip()]
         self.group_mention_only = bool(cfg.get("group_mention_only", True))
         self.my_aliases = [str(x).strip() for x in (cfg.get("my_aliases") or []) if str(x).strip()]
+        self.sender_whitelist = [str(x).strip() for x in (cfg.get("sender_whitelist") or []) if str(x).strip()]
+
+    def sender_allowed(self, sender):
+        """群聊发送者鉴权：sender 是否被允许驱动 agent。
+
+        - sender_whitelist 含 "*" → 显式开放，任何人（除自己/系统）都允许。
+        - sender_whitelist 配置了具体昵称 → 只允许名单内的人。
+        - sender_whitelist 为空（未配置）→ 默认拒绝（安全方向）。
+        """
+        sender = (sender or "").strip()
+        if not sender or sender == "self":
+            return False
+        if "*" in self.sender_whitelist:
+            return True
+        if not self.sender_whitelist:
+            return False
+        return sender in self.sender_whitelist
 
     def bind_wx(self, wx):
         self.wx = wx
@@ -161,6 +185,82 @@ class Bridge:
         except Exception as e:
             print(f"[bridge] 清除待推送失败：{e}", file=sys.stderr)
 
+    # ---- 终止卡死任务（手动归档/中断后的清理）----
+    def _clear_all_pending_for_chat(self, chat):
+        """清空某聊天的所有待推送（含卡死任务），返回清掉的条数。"""
+        items = self._load_pending()
+        removed = [p for p in items if p.get("chat") == chat]
+        if removed:
+            try:
+                with open(self.pending_file, "w", encoding="utf-8") as f:
+                    json.dump([p for p in items if p.get("chat") != chat], f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                print(f"[bridge] 清空待推送失败：{e}", file=sys.stderr)
+        return len(removed)
+
+    def _abort_session(self, chat, sid):
+        """终止指定会话正在执行的任务：cancel 回合 + 清 pending + 清等待/提问状态。
+
+        用于手动归档对话或中途中断后，解除桥卡死在该会话上的状态。
+        返回 True 表示已处理；sid 为空时返回 False。
+        """
+        if not sid:
+            return False
+        # 1) 清等待/提问状态（先解除 ask_user_question 挂起，避免 agent 继续等）
+        self._unregister_wait(sid)
+        # 2) 清该会话的待推送
+        self._clear_pending(chat, sid)
+        # 3) cancel 会话当前回合（若还存在）
+        try:
+            dsh = DshClient(base=self.base)
+            dsh.cancel(sid)
+        except DshError:
+            pass  # 会话已归档/不存在，无需 cancel
+        except Exception as e:
+            print(f"[bridge] 终止会话异常 {sid[:8]}: {e}", file=sys.stderr)
+        return True
+
+    def _abort_all_for_chat(self, chat):
+        """终止某聊天所有卡死任务：cancel 全部关联会话 + 清空 pending/wait/提问。"""
+        sids = set()
+        pending_total = 0
+        for p in self._load_pending():
+            if p.get("chat") == chat and p.get("sid"):
+                sids.add(p["sid"])
+                pending_total += 1
+        with self.lock:
+            for sid in list(self._waits.keys()):
+                if self._waits[sid].get("chat") == chat:
+                    sids.add(sid)
+            for sid in list(self._pending_q.keys()):
+                if self._pending_q[sid].get("chat") == chat:
+                    sids.add(sid)
+        for sid in sids:
+            self._abort_session(chat, sid)
+        # 兜底清空（_abort_session 已逐条清，这里确保无残留）
+        self._clear_all_pending_for_chat(chat)
+        return len(sids), pending_total
+
+    def _cleanup_archived(self, chat, sid):
+        """归档/中断自动清理：会话已不存在（被手动归档）时，解除其 pending/wait 状态。
+
+        返回 True 表示该会话已失效并清理；False 表示会话仍有效。
+        """
+        if not sid:
+            return False
+        try:
+            dsh = DshClient(base=self.base)
+            alive = dsh.get_session(sid) is not None
+        except Exception:
+            return False
+        if alive:
+            return False
+        # 会话已被归档/删除：清掉桥侧残留状态，避免重启后继续卡死
+        print(f"[bridge] 会话 {sid[:18]} 已不存在（可能被归档），自动清理其待推送/等待状态。", flush=True)
+        self._unregister_wait(sid)
+        self._clear_pending(chat, sid)
+        return True
+
     # ---- state ----
     def _save(self):
         save_state(self.state_path, self.state)
@@ -194,24 +294,43 @@ class Bridge:
             print(f"[bridge] 切换到 {chat} 失败：{e}", file=sys.stderr)
             return False
 
-    def send_text(self, chat, text, retries=2):
+    def send_text(self, chat, text, retries=1):
+        """发送文本到微信聊天，防重复发送。
+
+        防重复（P0 修复）：wxauto4 的 SendMsg 偶发「实际已发送成功，但返回的
+        status 不是『成功』」——旧实现此时会走重试分支**再发一条**，导致同一条
+        回复在微信里出现多条（重复回复 bug）。因此：
+          - 每次实际调用 SendMsg 前先做「短时间窗口同 chat 同文本」去重
+            （1.5s 内完全相同的文本不重发），即使底层误判也能挡住重复。
+          - SendMsg 调用一次即视为「已发送」并记录（无论响应如何），
+            仅在 _ensure_window 失败等明确未发送的情况下才考虑重试。
+        """
+        text = (text or "").strip()
+        if not text:
+            return True
         with UI_Lock():
             with self.lock:
+                now = time.time()
+                last_sent = self._last_text.get(chat)
+                if last_sent and last_sent[0] == text and (now - last_sent[1]) < 1.5:
+                    # 同一聊天 1.5s 内已发过完全相同文本 → 视为已发送，跳过防重复
+                    return True
                 for i in range(retries + 1):
-                    try:
-                        if not self._ensure_window(chat):
-                            return False
-                        resp = self.wx.SendMsg(msg=text, who=chat, clear=True, exact=True)
-                        if isinstance(resp, dict) and str(resp.get("status")) == "成功":
-                            return True
-                        if isinstance(resp, dict) and str(resp.get("status")) != "成功" and i < retries:
-                            time.sleep(1.0)
+                    if not self._ensure_window(chat):
+                        if i < retries:
+                            time.sleep(0.8)
                             continue
+                        return False
+                    try:
+                        resp = self.wx.SendMsg(msg=text, who=chat, clear=True, exact=True)
+                        # 已调用 SendMsg：无论响应如何都视为已发送（防重试导致重复）
+                        self._last_text[chat] = (text, time.time())
                         return True
                     except Exception as e:
                         print(f"[bridge] 发送文本失败 [{chat}]: {e}", file=sys.stderr)
                         if i < retries:
-                            time.sleep(1.0)
+                            time.sleep(0.8)
+                            continue
             return False
 
     def send_text_multi(self, chat, text, max_len=450):
@@ -339,6 +458,10 @@ class Bridge:
         return "\n".join(lines)
 
     def _handle_question(self, session_id, rpc_id, questions):
+        # 防重复推送（P0）：同一 rpc_id 的提问只转发一次，避免 mux 重复事件
+        # 导致用户收到多条相同问题、回复也重复。
+        if rpc_id and rpc_id == self._last_question_rpc.get(session_id):
+            return
         with self.lock:
             wait = self._waits.get(session_id)
             if not wait:
@@ -352,6 +475,8 @@ class Bridge:
                 "rpc_id": rpc_id, "questions": questions,
                 "chat": chat, "asked_at": time.time(),
             }
+            if rpc_id:
+                self._last_question_rpc[session_id] = rpc_id
         print(f"[bridge] 检测到提问 session={session_id[:8]} chat={chat}，已转发微信", flush=True)
         self.send_text(chat, self._format_questions(questions))
 
@@ -477,11 +602,18 @@ class Bridge:
                         break
         return answers
 
-    def try_answer_question(self, chat, content):
-        """把控制聊天的普通消息当作待回答问题的答案提交。消费掉返回 True。"""
+    def try_answer_question(self, chat, content, require_sender=True, sender=""):
+        """把控制聊天的普通消息当作待回答问题的答案提交。消费掉返回 True。
+
+        require_sender=True 且 sender 未通过 sender_allowed 鉴权时，不提交答案
+        （防群聊里任何人替 agent 做选择），仅返回 True 以消费该消息避免误当任务。
+        """
         sid, q = self._pending_question_for_chat(chat)
         if not q:
             return False
+        if require_sender and not self.sender_allowed(sender):
+            print(f"[bridge] 群聊回答提问被拒：发送者 {sender or '未知'} 不在 sender_whitelist", flush=True)
+            return True
         try:
             answers = self._build_answers(content, q["questions"])
             dsh = DshClient(base=self.base)
@@ -578,6 +710,10 @@ class Bridge:
             if cmd == "/help":
                 return [("text", HELP_TEXT)]
             if cmd == "/new":
+                # 新建对话：先清理旧 active 会话的卡死残留（归档/中断后），再新建
+                old_sid = self.active_for(chat)
+                if old_sid:
+                    self._abort_session(chat, old_sid)
                 nsid = dsh.create_session(cwd=self.cwd or None)
                 self.set_active(chat, nsid)
                 return [("text", f"✅ 已新建对话：{nsid}\n已设为当前。")]
@@ -633,11 +769,15 @@ class Bridge:
                     who = "👤" if m["role"] == "user" else "🤖"
                     lines.append(f"{who} {m['text']}")
                 return [("text", "\n".join(lines))]
-            if cmd == "/cancel":
+            if cmd in ("/cancel", "/stop"):
                 if not sid:
                     return [("text", "当前没有 active 会话")]
-                dsh.cancel(sid)
-                return [("text", f"✅ 已请求取消（{sid}）")]
+                self._abort_session(chat, sid)
+                verb = "已取消回合并清理待推送" if cmd == "/cancel" else "已终止任务（取消回合+清理待推送）"
+                return [("text", f"✅ {verb}（{sid}）")]
+            if cmd == "/stopall":
+                n_sids, n_pending = self._abort_all_for_chat(chat)
+                return [("text", f"✅ 已终止本聊天所有卡死任务：{n_sids} 个会话、{n_pending} 条待推送已清理。")]
             if cmd == "/task":
                 return self._handle_task(chat, rest)
             return [("text", f"未知命令：{cmd}\n/help 查看帮助")]
@@ -651,6 +791,10 @@ class Bridge:
         try:
             dsh = DshClient(base=self.base)
             sid = self.active_for(chat)
+            # 归档/中断自动清理：active 会话已被手动归档（get_session 不存在）时，
+            # 解除其残留 pending/wait，避免桥继续卡死在该会话上。
+            if sid and self._cleanup_archived(chat, sid):
+                sid = None
             # 关键：active 会话正在运行（忙）时不能排队 —— agent 若卡住（如等待用户
             # 回答的 ask_user_question），排进去的任务会一直不执行（「已受理但 DSH 无
             # 执行」）。忙时自动新建会话执行，保证任务真正跑起来。
@@ -690,6 +834,15 @@ class Bridge:
         dsh = DshClient(base=self.base)
         self._register_wait(sid, chat, task)
         try:
+            # 归档/中断自动清理：会话已被手动归档/删除时，不再等待其回合结束
+            # （否则 wait_turn_end 会一直等到超时，桥卡死在该任务上），如实上报并清理。
+            if self._cleanup_archived(chat, sid):
+                self._clear_pending(chat, sid)
+                try:
+                    self.send_text(chat, f"⚠️ 会话 {sid[:18]} 已被归档/删除，任务「{task}」已终止。")
+                except Exception:
+                    pass
+                return
             # 关键：必须把 from_seq 传给 wait_turn_end —— 否则它会匹配到会话里更早的
             # 旧回合 turn/end，任务还没跑完就提前返回，导致「任务没完成却推送了完成」。
             # keep_waiting：等用户回答 ask_user_question 提问时顺延超时，不误判结束。
@@ -920,6 +1073,7 @@ def main():
             "group_whitelist": cfg.get("group_whitelist") or [],
             "group_mention_only": bool(cfg.get("group_mention_only", True)),
             "my_aliases": cfg.get("my_aliases") or [],
+            "sender_whitelist": cfg.get("sender_whitelist") or [],
         })
         return 0
 
@@ -985,8 +1139,12 @@ def main():
     if bridge.group_mention_only and not bridge.my_aliases:
         print("[bridge] ⚠️ 群聊 @ 策略已开启但无法确定你的昵称（GetMyInfo 为空且未配置 my_aliases）："
               "群聊消息将不会响应。可在 DSH 设置 wxauto → myAliases 配置昵称别名。", file=sys.stderr)
+    _sender_txt = (",".join(bridge.sender_whitelist)
+                   if bridge.sender_whitelist
+                   else "默认拒绝（未配置，群聊无人能驱动 agent）")
     print(f"[bridge] 群聊策略：白名单={bridge.group_whitelist or '不限'}，"
-          f"{'仅响应 @ 我' if bridge.group_mention_only else '响应全部消息'}（我的昵称别名：{bridge.my_aliases or '未知'}）",
+          f"{'仅响应 @ 我' if bridge.group_mention_only else '响应全部消息'}（我的昵称别名：{bridge.my_aliases or '未知'}）"
+          f"，发送者白名单={_sender_txt}",
           flush=True)
     # 预读当前可见消息为已处理：仅首次运行（seen 文件不存在）才做，
     # 重启时 seen 已持久化，无需再切窗口（避免抢鼠标）
@@ -997,14 +1155,32 @@ def main():
         save_seen(seen_file, seen)
         print(f"[bridge] 首次运行：已预读 {len(seen)} 条历史消息为已处理。", flush=True)
 
-    # 恢复待推送：桥之前崩溃时未完成的任务完成推送，重启后补发
+    # 恢复待推送：桥之前崩溃时未完成的任务完成推送，重启后补发。
+    # 归档/中断自动清理：恢复前检查会话是否还存在，已归档的直接清掉待推送，
+    # 避免重启后又去等一个已归档会话的回合（卡死 + 反复补发）。
     pending = bridge._load_pending()
+    revived = 0
+    dropped = 0
     for p in pending:
-        if p.get("chat") and p.get("sid") and p.get("task"):
-            print(f"[bridge] 恢复待推送：{p['chat']} / {p['sid'][:18]} / {p['task'][:30]}", flush=True)
-            t = threading.Thread(target=bridge._wait_and_push,
-                                 args=(p["chat"], p["sid"], p["task"], p.get("from_seq", 0)), daemon=True)
-            t.start()
+        if not (p.get("chat") and p.get("sid") and p.get("task")):
+            continue
+        sid = p["sid"]
+        try:
+            alive = DshClient(base=bridge.base).get_session(sid) is not None
+        except Exception:
+            alive = True  # DSH 查询失败时保守补发，等 _wait_and_push 再兜底
+        if not alive:
+            print(f"[bridge] 丢弃待推送（会话 {sid[:18]} 已归档/删除）：{p['task'][:30]}", flush=True)
+            bridge._clear_pending(p["chat"], sid)
+            dropped += 1
+            continue
+        print(f"[bridge] 恢复待推送：{p['chat']} / {sid[:18]} / {p['task'][:30]}", flush=True)
+        t = threading.Thread(target=bridge._wait_and_push,
+                             args=(p["chat"], sid, p["task"], p.get("from_seq", 0)), daemon=True)
+        t.start()
+        revived += 1
+    if dropped:
+        print(f"[bridge] 恢复待推送完成：补发 {revived}，丢弃已归档 {dropped}", flush=True)
 
     # ask_user_question 转发：订阅 DSH events.mux，把提问推送到微信并接收回答。
     # 仅 full 模式；未安装 websocket-client 时降级（桥其余功能不受影响）。
@@ -1037,13 +1213,21 @@ def main():
             if rec.get("chat") not in chats:
                 continue
 
-            # 群聊策略（P0）：白名单 + @ 响应。回答桥发起的提问豁免；
+            # 群聊策略（P0）：群白名单 + 发送者白名单 + @ 响应。回答桥发起的提问豁免；
             # 消息记录已由轮询写入日志，这里只决定「是否响应」。
             group = is_group_chat(rec)
             eligible = True
             if group:
+                # 1) 群白名单：白名单非空时必须在此群内
                 if bridge.group_whitelist and rec["chat"] not in bridge.group_whitelist:
                     eligible = False
+                # 2) 发送者鉴权（P0 安全）：只允许 sender_whitelist 内的成员驱动 agent。
+                #    未配置 sender_whitelist → 群聊默认拒绝（防止群里任何人 @ 你即可操控）；
+                #    配置 ["*"] → 显式开放，所有 @ 都接受。
+                elif not bridge.sender_allowed(rec.get("sender", "")):
+                    eligible = False
+                    print(f"[bridge] 群聊 {rec['chat']} 发送者 {rec.get('sender','')} 不在 sender_whitelist，忽略", flush=True)
+                # 3) @ 检查（开启时）
                 elif bridge.group_mention_only and not mentioned_me(content, bridge.my_aliases, rec.get("at")):
                     eligible = False
                 else:
@@ -1065,8 +1249,11 @@ def main():
                         print(f"[bridge] → file {payload} ok={ok}", flush=True)
                 continue
 
-            # 2) 待回答的 DSH 提问：普通消息当作答案提交（优先于关键词/任务；不受群聊策略限制）
-            if bridge.try_answer_question(rec["chat"], content):
+            # 2) 待回答的 DSH 提问：普通消息当作答案提交（优先于关键词/任务）。
+            #    群聊中回答提问同样需要发送者通过鉴权（否则任何群成员都能替 agent 做选择）；
+            #    私聊不受 sender_whitelist 限制（聊天窗口唯一确定对方）。
+            if bridge.try_answer_question(rec["chat"], content,
+                                          require_sender=group, sender=rec.get("sender", "")):
                 continue
 
             # 群聊未通过策略：不自动回复、不当任务（仅记录）
