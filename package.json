@@ -39,7 +39,26 @@
     "cordis.patch.yml",
     "skills/",
     "README.md",
+    "README.en.md",
+    "CHANGELOG.md",
     "install.ps1"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/br1nosense/dsh-wxauto-plugin.git"
+  },
+  "homepage": "https://github.com/br1nosense/dsh-wxauto-plugin#readme",
+  "bugs": {
+    "url": "https://github.com/br1nosense/dsh-wxauto-plugin/issues"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "wechat",
+    "wxauto",
+    "notify",
+    "skill"
+  ],
+  "author": "br1nosense",
   "license": "MIT"
 }
