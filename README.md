@@ -29,6 +29,39 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 >   apiproxy 暴露 `wxauto` 命名空间一步会打印警告（不影响插件主体功能，可手动补）。
 > - 卸载：`dsh plugin --profile web rm @dsh-user/dsh-wxauto` 后重启 dsh web。
 
+## 常见问题：安装插件后 dsh 启动失败（peerDependencies 解析）
+
+**症状**：安装本插件（bundle）后重启 dsh，web 启动报错 / 起不来。
+
+**原因**：本插件把 `@deepseek-ai/schemastery`（以及 `@deepseek-ai/cordis`、`@deepseek-ai/dsh-settings`）
+声明为 `peerDependencies`，但插件目录（clone 下来的仓库）下没有 `node_modules`。Node ESM 会从插件
+所在目录**逐级向上**查找 `node_modules`，却找不到 DSH 自身嵌套目录里的这几个包（dsh 安装目录通常
+不在该查找路径上）。
+
+**修复**（一次性，本地环境级）：在**插件工作区根目录**（即插件目录的父目录，如把插件 clone 到
+`C:\code\AI\DSH\dsh-wxauto-plugin`，则根目录是 `C:\code\AI\DSH`）的 `node_modules\@deepseek-ai\` 下
+创建 3 个目录联接（Junction），指向 DSH 自带的同名包：
+
+| 包 | 指向 |
+|---|---|
+| `schemastery` | `<dsh 安装目录>\node_modules\@deepseek-ai\schemastery`（v3.18.1） |
+| `cordis` | `<dsh 安装目录>\node_modules\@deepseek-ai\cordis` |
+| `dsh-settings` | `<dsh 安装目录>\node_modules\@deepseek-ai\dsh-settings` |
+
+例如本机 dsh 位于 `C:\Users\<你>\AppData\Roaming\nvm\v24.19.0\node_modules\@deepseek-ai\dsh`：
+
+```powershell
+$dsh = 'C:\Users\<你>\AppData\Roaming\nvm\v24.19.0\node_modules\@deepseek-ai\dsh\node_modules\@deepseek-ai'
+$dst = 'C:\code\AI\DSH\node_modules\@deepseek-ai'
+New-Item -ItemType Directory -Force -Path $dst | Out-Null
+foreach ($p in 'schemastery','cordis','dsh-settings') {
+  New-Item -ItemType Junction -Path (Join-Path $dst $p) -Target (Join-Path $dsh $p)
+}
+```
+
+> 该修复是**本机环境级**配置，创建在 `node_modules` 下，**不应提交到仓库**；dsh 升级或换机后路径变化
+> 需重建（建议把上面脚本存成 `fix-peer-deps.ps1`，换环境后重跑）。
+
 ## 环境要求
 
 | 项 | 要求 |
